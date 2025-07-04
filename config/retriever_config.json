@@ -1,0 +1,22 @@
+{
+    "dataset_kwargs":{
+        "nuscenes_dataset_kwargs":{
+            "root_dir":"../Autonomous-Driving-Perception-Stack/data/nuscenes",
+            "table_blob_paths":[
+                "../Autonomous-Driving-Perception-Stack/data/nuscenes/trainval03_blobs_US/tables.json"
+            ]
+        }
+    }, 
+    "retriever_kwargs":{
+        "ImageBind_kwargs":{
+            "pretrained":true, 
+            "device":"cuda"
+        },
+        "embeddings_type":"faiss", 
+        "embeddings_dir":"nuscenes_embeddings/trainval03_blobs_US", 
+        "faiss_index_path":"nuscenes_embeddings/trainval03_blobs_US/faiss_<class 'faiss.swigfaiss.IndexIDMap'>.faiss",
+        "faiss_index_id_to_token":"nuscenes_embeddings/trainval03_blobs_US/faiss_index_id_to_token.json",
+        "token_id_to_image_path":"nuscenes_embeddings/trainval03_blobs_US/token_id_to_image_path.json", 
+        "output_path":"nuscenes_embeddings/trainval03_blobs_US/top_1"
+    }
+}
