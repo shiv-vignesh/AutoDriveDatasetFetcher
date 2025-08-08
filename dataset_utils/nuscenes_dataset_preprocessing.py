@@ -1,5 +1,7 @@
+import random
 import os
 import json
+from collections import defaultdict
 from typing import List, Dict, Iterable
 
 import numpy as np
@@ -13,26 +15,39 @@ import albumentations
 import transformers
 from transformers import BertTokenizer, ViTImageProcessor
 
-from enums import Enums
+from .enums import Enums
 
 class NuScenesObjectDetectDataset(Dataset):    
     
-    def __init__(self, table_blob_paths:list, root_dir:str):
-        
+    def __init__(self, table_blob_paths:list, global_captions_paths:list,
+                root_dir:str):
+
         self.sample_tokens = []
         self.tables = {}
+        self.global_captions = {}
+
         self.table_blob_paths = table_blob_paths
-        
+        self.global_captions_paths = global_captions_paths
+
         self.root_dir = root_dir
-                
-        for blob_table_path in table_blob_paths:
-            self.parse_blob_table(blob_table_path)
-    
+
+        if global_captions_paths is not None:        
+            for blob_table_path, global_captions_path in zip(table_blob_paths, global_captions_paths):
+                self.parse_blob_table(blob_table_path)
+                self.parse_global_captions(global_captions_path)    
+        else:
+            for blob_table_path in table_blob_paths:
+                self.parse_blob_table(blob_table_path)
+
+    def parse_global_captions(self, global_captions_path:str):
+        global_captions = json.load(open(global_captions_path))
+        self.global_captions.update(global_captions)
+            
     def parse_blob_table(self, blob_table_path:str):
-        
+
         table = json.load(open(blob_table_path))
         self.sample_tokens.extend([sample_token for sample_token in table])
-        self.tables.update(table)
+        self.tables.update(table)        
 
     def __len__(self):
         return len(self.sample_tokens)
@@ -44,6 +59,11 @@ class NuScenesObjectDetectDataset(Dataset):
         cam_front_fp = self.tables[sample_token]['cam_front_fp']
         labels_2d_cam_front = self.tables[sample_token]['labels_2d_cam_front']
         
+        if self.global_captions_paths is not None and sample_token in self.global_captions:
+            captions = self.global_captions[sample_token]
+        else:
+            captions = None
+        
         # splitting because 
         # ../data/nuscenes/trainval04_blobs_US/samples/CAM_FRONT/filename.jpg
         lidar_top_fp = f"{self.root_dir}/{'/'.join(lidar_top_fp.split('/')[3:])}"
@@ -53,7 +73,8 @@ class NuScenesObjectDetectDataset(Dataset):
             'sample_token':sample_token, 
             'lidar_top_fp':lidar_top_fp, 
             'cam_front_fp':cam_front_fp, 
-            'labels_2d_cam_front':labels_2d_cam_front
+            'labels_2d_cam_front':labels_2d_cam_front,
+            "captions":captions
         }
 
 
@@ -335,10 +356,124 @@ class NuScenesRegionCLIP:
     def __call__(self, data_items:dict):
         return self.preprocess(data_items)
     
+class NuScenesCLIPCollateFn:
+    def __init__(self, image_preprocessor:str="vit_image_preprocessor", 
+                text_preprocessor:str="bert_tokenizer", 
+                image_resize:tuple=(224, 224), 
+                original_size:tuple=(900, 1600)):
+    
+        self.image_preprocessor_type = image_preprocessor
+        self.text_preprocessor_type = text_preprocessor
+        self.image_resize = image_resize
+        self.original_size = original_size
+        
+        self.original_width = self.original_size[1]
+        self.original_height = self.original_size[0]
+
+        self.resized_width = self.image_resize[1]
+        self.resized_height = self.image_resize[0]         
+
+        if self.image_preprocessor_type == "vit_image_preprocessor":
+            self.image_preprocessor = ViTImageProcessor.from_pretrained("google/vit-base-patch16-224")
+            self.patch_size = (16, 16)
+            self.num_patches = (self.resized_width//self.patch_size[0]) ** 2
+
+        if self.text_preprocessor_type == "bert_tokenizer":
+            self.text_preprocessor = BertTokenizer.from_pretrained("bert-base-uncased")   
+   
+        self.image_only_transformation = albumentations.Compose(
+            [albumentations.Resize(height=self.resized_height, width=self.resized_width, always_apply=True)]
+        )
+
+    def create_count_map(self, labels_2d_cam_front):
+
+        count_map = defaultdict(int)
+        for obj in labels_2d_cam_front:
+            category = obj["category_name"]
+            count_map[category] += 1
+
+        return count_map
+    
+    def create_similarity_matrix(self, batch_object_counts:list):
+        
+        batch_size = len(batch_object_counts)
+        sim_matrix = torch.zeros((batch_size, batch_size))
+        
+        for i in range(batch_size):
+            set_i = set(batch_object_counts[i].keys())
+            for j in range(batch_size):
+                set_j = set(batch_object_counts[j].keys())
+                intersection = len(set_i & set_j)
+                union = len(set_i | set_j)
+                sim_matrix[i, j] = intersection / union if union > 0 else 0.0
+
+        return sim_matrix        
+    
+    def preprocess(self, data_items:dict):
+        """
+        1. Read image from cv2.imread(cam_front_fp)
+        2. Resize the image to image size. Use albumentations. 
+            - transformed_dict['image']
+        3. Use Query Templates to transform
+            - labels to <Query> --> labels list
+            - Tokenize labels list to 
+                - tensor shape (total_labels, max_seq_len)
+                - tensor shape (total_labels, batch_idx)
+
+        4. Return 
+            - (B, N) = image patches tensor (B, 3, 224, 224)
+            - (B, N) = captions tensor (B, max_seq_len)            
+        """
+
+        batch_pixel_values = []
+        batch_captions = []
+        sample_tokens = []
+
+        batch_object_counts = []
+
+        for data_item in data_items:
+            
+            if data_item['captions'] is None:
+                continue
+            
+            cam_front_fp = data_item['cam_front_fp']
+            captions = data_item['captions']['llava_generated_captions']
+
+            cam_front_image = cv2.imread(cam_front_fp)
+
+            if self.image_preprocessor_type == "vit_image_preprocessor":
+                pixel_values = self.image_preprocessor(cam_front_image, return_tensors="pt").pixel_values
+                batch_pixel_values.append(pixel_values.squeeze(0))
+
+            generated_caption = random.choice(captions)
+            batch_captions.append(generated_caption)
+            
+            count_map = self.create_count_map(data_item['labels_2d_cam_front'])
+            batch_object_counts.append(count_map)
+
+        if self.text_preprocessor_type == "bert_tokenizer":
+            encoded_inputs = self.text_preprocessor(batch_captions, padding=True, truncation=True, return_tensors="pt")
+            batch_input_ids = encoded_inputs['input_ids']
+            batch_attention_masks = encoded_inputs['attention_mask']
+
+        batch_pixel_values = torch.stack(batch_pixel_values, dim=0)
+        sim_matrix = self.create_similarity_matrix(batch_object_counts)
+
+        return {
+            "batch_pixel_values":batch_pixel_values, 
+            "batch_input_ids":batch_input_ids,
+            "batch_attention_masks":batch_attention_masks,
+            "sim_matrix":sim_matrix
+        }
+
+    def __call__(self, data_items:dict):
+        return self.preprocess(data_items)
+    
 if __name__ == "__main__":
     
     dataset =NuScenesObjectDetectDataset(
-        table_blob_paths=['../trainval01_blobs/tables.json'],
+        table_blob_paths=['../trainval03_blobs_US/tables.json'],
+        global_captions_paths=['../trainval03_blobs_US/global_captions.json'],
         root_dir='../'
     )
     
@@ -347,10 +482,12 @@ if __name__ == "__main__":
     dataloader = DataLoader(
         dataset=dataset, 
         batch_size=4, 
-        collate_fn=NuScenesRegionCLIP(
-            positive_mask_type="absolute"
-        )
+        collate_fn=NuScenesCLIPCollateFn()
     )
     
     for data in dataloader:
+        for k, v in data.items():
+            if torch.is_tensor(v):
+                print(f'{k} {v.shape}')
+                
         exit(1)
